@@ -1,23 +1,24 @@
 local JSON = require "kong.plugins.middleman.json"
-local cjson = require "cjson"
 local url = require "socket.url"
 
 local string_format = string.format
 
+local kong = kong
 local kong_response = kong.response
 
-local get_headers = ngx.req.get_headers
-local get_uri_args = ngx.req.get_uri_args
-local read_body = ngx.req.read_body
-local get_body = ngx.req.get_body_data
 local get_method = ngx.req.get_method
-local ngx_re_match = ngx.re.match
 local ngx_re_find = ngx.re.find
+local ngx_set_header = ngx.req.set_header
+local pairs = pairs
 
 local HTTP = "http"
 local HTTPS = "https"
 
 local _M = {}
+
+function JSON.assert(_is_valid, message)
+  ngx.log(ngx.ERR, "[middleman] failed to parse json: ", message)
+end
 
 local function parse_url(host_url)
   local parsed_url = url.parse(host_url)
@@ -52,111 +53,93 @@ function _M.execute(conf)
   ok, err = sock:connect(host, port)
   if not ok then
     ngx.log(ngx.ERR, name .. "failed to connect to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    return kong_response.exit(500, "internal error")
   end
 
   if parsed_url.scheme == HTTPS then
     local _, err = sock:sslhandshake(true, host, false)
     if err then
       ngx.log(ngx.ERR, name .. "failed to do SSL handshake with " .. host .. ":" .. tostring(port) .. ": ", err)
+      return kong_response.exit(500, "internal error")
     end
   end
 
   ok, err = sock:send(payload)
   if not ok then
     ngx.log(ngx.ERR, name .. "failed to send data to " .. host .. ":" .. tostring(port) .. ": ", err)
+    return kong_response.exit(500, "internal error")
   end
 
   local line, err = sock:receive("*l")
-
   if err then 
     ngx.log(ngx.ERR, name .. "failed to read response status from " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    return kong_response.exit(500, "internal error")
   end
 
   local status_code = tonumber(string.match(line, "%s(%d%d%d)%s"))
-  local headers = {}
+  if status_code > 399 then
+    local error_message = "internal error"
+    if status_code == 401 then
+      error_message = "unauthorized"
+    end
+    return kong_response.exit(status_code, error_message)
+  end
 
   repeat
     line, err = sock:receive("*l")
     if err then
       ngx.log(ngx.ERR, name .. "failed to read header " .. host .. ":" .. tostring(port) .. ": ", err)
-      return
-    end
-
-    local pair = ngx_re_match(line, "(.*):\\s*(.*)", "jo")
-
-    if pair then
-      headers[string.lower(pair[1])] = pair[2]
+      return kong_response.exit(500, "internal error")
     end
   until ngx_re_find(line, "^\\s*$", "jo")
 
-  local body, err = sock:receive(tonumber(headers['content-length']))
-  if err then
-    ngx.log(ngx.ERR, name .. "failed to read body " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
-  end
+  local body = {}
+  repeat
+    line, err = sock:receive("*l")
+    if err then
+      ngx.log(ngx.ERR, name .. "failed to read body " .. host .. ":" .. tostring(port) .. ": ", err)
+      return kong_response.exit(500, "internal error")
+    end
+
+    local raw_body = string.match(line, "%b{}")
+    if raw_body then
+      body, err = JSON:decode(raw_body)
+      if err then
+        ngx.log(ngx.ERR, name .. "failed to parse body " .. host .. ":" .. tostring(port) .. ": ", err)
+        return kong_response.exit(500, "internal error")
+      end
+    end
+  until ngx_re_find(line, "^\\s*$", "jo")
 
   ok, err = sock:setkeepalive(conf.keepalive)
   if not ok then
     ngx.log(ngx.ERR, name .. "failed to keepalive to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    return kong_response.exit(500, "internal error")
   end
 
-  if status_code > 299 then
-    if err then 
-      ngx.log(ngx.ERR, name .. "failed to read response from " .. host .. ":" .. tostring(port) .. ": ", err)
-    end
-
-    local response_body
-    if conf.response == "table" then 
-      response_body = JSON:decode(string.match(body, "%b{}"))
-    else
-      response_body = string.match(body, "%b{}")
-    end
-
-    return kong_response.send(status_code, response_body)
+  for key, value in pairs(body) do
+    ngx_set_header("X-Introspection-" .. key, value)
   end
-
 end
 
-function _M.compose_payload(parsed_url)
-    local headers = get_headers()
-    local uri_args = get_uri_args()
-    local next = next
-    
-    read_body()
-    local body_data = get_body()
+function _M.compose_payload(introspection_details)
+    local request_uri_args = kong.request.get_query()
+    local request_body = kong.request.get_body()
 
-    headers["target_uri"] = ngx.var.request_uri
-    headers["target_method"] = ngx.var.request_method
-
-    local url
-    if parsed_url.query then
-      url = parsed_url.path .. "?" .. parsed_url.query
-    else
-      url = parsed_url.path
-    end
-    
-    local raw_json_headers = JSON:encode(headers)
-    local raw_json_body_data = JSON:encode(body_data)
-
-    local raw_json_uri_args
-    if next(uri_args) then 
-      raw_json_uri_args = JSON:encode(uri_args) 
-    else
-      -- Empty Lua table gets encoded into an empty array whereas a non-empty one is encoded to JSON object.
-      -- Set an empty object for the consistency.
-      raw_json_uri_args = "{}"
+    local request_params = kong.table.merge(request_uri_args, request_body)
+    local utoken = request_params["utoken"]
+    if not utoken then
+      utoken = request_params["token"]
     end
 
-    local payload_body = [[{"headers":]] .. raw_json_headers .. [[,"uri_args":]] .. raw_json_uri_args.. [[,"body_data":]] .. raw_json_body_data .. [[}]]
-    
-    local payload_headers = string_format(
-      "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nContent-Length: %s\r\n",
-      url, parsed_url.host, #payload_body)
-  
-    return string_format("%s\r\n%s", payload_headers, payload_body)
+    local introspection_url = introspection_details.path
+    if utoken then
+      introspection_url = introspection_url .. "?utoken=" .. utoken
+    end
+
+    return string_format(
+      "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+      introspection_url, introspection_details.host)
 end
 
 return _M
