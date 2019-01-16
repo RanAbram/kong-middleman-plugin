@@ -13,6 +13,8 @@ local get_body = ngx.req.get_body_data
 local get_method = ngx.req.get_method
 local ngx_re_match = ngx.re.match
 local ngx_re_find = ngx.re.find
+local ngx_set_header = ngx.req.set_header
+local pairs = pairs
 
 local HTTP = "http"
 local HTTPS = "https"
@@ -68,13 +70,18 @@ function _M.execute(conf)
   end
 
   local line, err = sock:receive("*l")
-
   if err then 
     ngx.log(ngx.ERR, name .. "failed to read response status from " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    return kong_response.exit(500, "internal error")
   end
 
   local status_code = tonumber(string.match(line, "%s(%d%d%d)%s"))
+  if status_code > 299 then
+    return kong_response.exit(status_code, "internal error")
+  end
+
+  ngx_set_header("JWT", "ran")
+
   local headers = {}
 
   repeat
@@ -84,9 +91,11 @@ function _M.execute(conf)
       return
     end
 
-    local pair = ngx_re_match(line, "(.*):\\s*(.*)", "jo")
+    local pair = ngx_re_match(line, "([^:\\s]+):\\s*(.*)", "jo")
 
     if pair then
+      kong.log(pair[1])
+      kong.log(pair[2])
       headers[string.lower(pair[1])] = pair[2]
     end
   until ngx_re_find(line, "^\\s*$", "jo")
@@ -103,7 +112,13 @@ function _M.execute(conf)
     return
   end
 
-  if status_code > 299 then
+  if status_code == 200 then
+    for k, v in pairs(JSON:decode(string.match(body, "%b{}"))) do
+      kong.log(k)
+      kong.log(v)
+    end
+    return
+  else
     if err then 
       ngx.log(ngx.ERR, name .. "failed to read response from " .. host .. ":" .. tostring(port) .. ": ", err)
     end
